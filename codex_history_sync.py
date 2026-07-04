@@ -75,7 +75,7 @@ def backup_sqlite(src: Path, dst: Path) -> bool:
     if not src.exists():
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
-    source = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    source = connect_sqlite_readonly(src)
     try:
         target = sqlite3.connect(str(dst))
         try:
@@ -85,6 +85,29 @@ def backup_sqlite(src: Path, dst: Path) -> bool:
     finally:
         source.close()
     return True
+
+
+def connect_sqlite_readonly(path: Path, timeout: float = 5) -> sqlite3.Connection:
+    """Open a local SQLite file read-only, with fallbacks for flaky URI handling."""
+    attempts = [
+        (f"file:{path}?mode=ro", True),
+        (f"file:{path}?mode=ro&immutable=1", True),
+        (str(path), False),
+    ]
+    last_error: sqlite3.Error | None = None
+    for target, use_uri in attempts:
+        try:
+            con = sqlite3.connect(target, uri=use_uri, timeout=timeout)
+            try:
+                con.execute("PRAGMA schema_version").fetchone()
+            except sqlite3.Error:
+                con.close()
+                raise
+            return con
+        except sqlite3.Error as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
 
 
 def table_blocks(text: str) -> dict[str, str]:
@@ -109,6 +132,15 @@ def replace_or_prepend_scalar(text: str, key: str, value: str) -> str:
         return re.sub(pattern, replacement, text, count=1)
     prefix = replacement + "\n"
     return prefix + text if text else prefix
+
+
+def scalar_value(text: str, key: str) -> str | None:
+    pattern = rf'(?m)^\s*{re.escape(key)}\s*=\s*"([^"]+)"\s*$'
+    match = re.search(pattern, text)
+    if not match:
+        return None
+    value = match.group(1).strip()
+    return value or None
 
 
 def ensure_history_save_all(text: str) -> str:
@@ -234,7 +266,7 @@ class CodexHistorySync:
             print(message, file=sys.stderr)
 
     def backup_root(self) -> Path:
-        return self.cc_switch_home / "backups" / "codex-history-sync-tool"
+        return self.codex_home / "backups" / "codex-history-sync-tool"
 
     def create_backup(self) -> str | None:
         backup_dir = self.backup_root() / time.strftime("%Y%m%d_%H%M%S")
@@ -263,7 +295,7 @@ class CodexHistorySync:
         if self.live_config.exists():
             texts.append(self.live_config.read_text(encoding="utf-8"))
         if self.cc_switch_db.exists():
-            con = sqlite3.connect(f"file:{self.cc_switch_db}?mode=ro", uri=True, timeout=5)
+            con = connect_sqlite_readonly(self.cc_switch_db, timeout=5)
             con.row_factory = sqlite3.Row
             try:
                 for row in con.execute("select settings_config from providers where app_type='codex'"):
@@ -284,7 +316,7 @@ class CodexHistorySync:
         ids = {"default", "codex-official"}
         if not self.cc_switch_db.exists():
             return ids
-        con = sqlite3.connect(f"file:{self.cc_switch_db}?mode=ro", uri=True, timeout=5)
+        con = connect_sqlite_readonly(self.cc_switch_db, timeout=5)
         con.row_factory = sqlite3.Row
         try:
             for row in con.execute("select id, coalesce(category, '') as category from providers where app_type='codex'"):
@@ -297,6 +329,15 @@ class CodexHistorySync:
     def current_provider_is_official(self) -> bool:
         provider_id = self.current_provider_id()
         return bool(provider_id and provider_id in self.official_provider_ids())
+
+    def current_history_bucket(self) -> str:
+        if self.current_provider_is_official():
+            return "openai"
+        if self.live_config.exists():
+            value = scalar_value(self.live_config.read_text(encoding="utf-8"), "model_provider")
+            if value:
+                return value
+        return "custom"
 
     def normalize_settings_json(self) -> dict[str, object]:
         result = {"changed": False, "path": str(self.cc_switch_settings)}
@@ -444,8 +485,8 @@ class CodexHistorySync:
             tmp_path.unlink(missing_ok=True)
             return False
 
-    def normalize_rollouts(self, backup_dir: str | None) -> dict[str, object]:
-        result = {"changed": 0, "scanned": 0}
+    def normalize_rollouts(self, backup_dir: str | None, target_model_provider: str) -> dict[str, object]:
+        result = {"changed": 0, "scanned": 0, "model_provider_changed": 0}
         backup_path = Path(backup_dir) / "rollout_session_meta_backup.jsonl" if backup_dir else None
         backup_handle = None
         if backup_path and not self.dry_run:
@@ -463,7 +504,8 @@ class CodexHistorySync:
                     continue
                 file_rollout_id = rollout_id_from_name(path)
                 id_changed = payload.get("id") != file_rollout_id
-                if not id_changed:
+                provider_changed = payload.get("model_provider") != target_model_provider
+                if not id_changed and not provider_changed:
                     continue
                 if backup_handle is not None:
                     backup_handle.write(
@@ -478,11 +520,14 @@ class CodexHistorySync:
                         + "\n"
                     )
                 payload["id"] = file_rollout_id
+                payload["model_provider"] = target_model_provider
                 obj["payload"] = payload
                 newline = "\r\n" if line.endswith("\r\n") else "\n"
                 new_line = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + newline
                 if self.replace_line_streaming(path, line_index, new_line):
                     result["changed"] += 1
+                    if provider_changed:
+                        result["model_provider_changed"] += 1
         finally:
             if backup_handle is not None:
                 backup_handle.close()
@@ -550,7 +595,7 @@ class CodexHistorySync:
             return titles
         return titles
 
-    def normalize_state_db(self, path: Path, index_titles: dict[str, str]) -> dict[str, object]:
+    def normalize_state_db(self, path: Path, index_titles: dict[str, str], target_model_provider: str) -> dict[str, object]:
         result = {
             "path": str(path),
             "missing": not path.exists(),
@@ -565,14 +610,17 @@ class CodexHistorySync:
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA busy_timeout=10000")
         try:
-            # We no longer force `threads.model_provider` to a single bucket.
-            # Each thread keeps the provider it was created under; the unified
-            # history list comes from session_index.jsonl (bucket-agnostic),
-            # which rebuild_session_index() regenerates from all rollout files.
             existing = {
                 row["id"]: row
-                for row in con.execute("select id, title from threads")
+                for row in con.execute("select id, title, model_provider from threads")
             }
+
+            before = con.total_changes
+            con.execute(
+                "update threads set model_provider=? where model_provider<>?",
+                (target_model_provider, target_model_provider),
+            )
+            result["provider_rows_updated"] += con.total_changes - before
 
             for rollout_id, title in index_titles.items():
                 row = existing.get(rollout_id)
@@ -607,7 +655,7 @@ class CodexHistorySync:
                         info["created_at"],
                         info["updated_at"],
                         info["source"],
-                        info["model_provider"],
+                        target_model_provider,
                         info["cwd"],
                         info["title"],
                         archived,
@@ -639,7 +687,7 @@ class CodexHistorySync:
         state_rows: dict[str, dict[str, object]] = {}
         preferred_db = next((path for path in self.state_dbs if path.exists()), None)
         if preferred_db:
-            con = sqlite3.connect(f"file:{preferred_db}?mode=ro", uri=True, timeout=5)
+            con = connect_sqlite_readonly(preferred_db, timeout=5)
             con.row_factory = sqlite3.Row
             try:
                 for row in con.execute("select id, title, updated_at from threads"):
@@ -710,12 +758,13 @@ class CodexHistorySync:
             "codex_home": str(self.codex_home),
             "sqlite_home": str(self.sqlite_home),
             "current_provider_id": self.current_provider_id(),
+            "current_history_bucket": self.current_history_bucket(),
             "state_dbs": [],
         }
         for db_path in self.state_dbs:
             entry: dict[str, object] = {"path": str(db_path), "exists": db_path.exists()}
             if db_path.exists():
-                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+                con = connect_sqlite_readonly(db_path, timeout=5)
                 con.row_factory = sqlite3.Row
                 try:
                     rows = list(con.execute("select model_provider, count(*) as cnt from threads group by model_provider order by model_provider"))
@@ -730,16 +779,18 @@ class CodexHistorySync:
         backup_dir = self.create_backup()
         block_union = self.gather_block_union()
         current_index_titles = self.load_current_index_titles()
+        target_model_provider = self.current_history_bucket()
         settings_report = self.normalize_settings_json()
         common_report = self.normalize_common_config(block_union)
         provider_report = self.normalize_provider_templates(block_union)
         live_config_report = self.normalize_live_config(block_union)
-        rollout_report = self.normalize_rollouts(backup_dir)
-        state_reports = [self.normalize_state_db(path, current_index_titles) for path in self.state_dbs]
+        rollout_report = self.normalize_rollouts(backup_dir, target_model_provider)
+        state_reports = [self.normalize_state_db(path, current_index_titles, target_model_provider) for path in self.state_dbs]
         index_report = self.rebuild_session_index(current_index_titles)
         return {
             "backup_dir": backup_dir,
             "current_provider_id": self.current_provider_id(),
+            "target_model_provider": target_model_provider,
             "settings": settings_report,
             "common_config": common_report,
             "provider_templates": provider_report,
@@ -825,7 +876,7 @@ def build_parser() -> argparse.ArgumentParser:
     default_cc_switch_home = Path.home() / ".cc-switch"
 
     parser = argparse.ArgumentParser(
-        description="Keep Codex local session history visible across cc-switch provider changes.",
+        description="Union all local Codex history, then retag it to the currently active cc-switch provider bucket.",
     )
     parser.add_argument(
         "--codex-home",
@@ -857,9 +908,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers = parser.add_subparsers(dest="command", required=False)
-    subparsers.add_parser("sync", help="Run one sync pass (union-merge shared blocks; never forces model_provider).")
+    subparsers.add_parser(
+        "sync",
+        help="Run one sync pass: union all local history, then retag rollout/state history to the active provider bucket.",
+    )
 
-    watch_parser = subparsers.add_parser("watch", help="Poll cc-switch and re-run sync after provider changes.")
+    watch_parser = subparsers.add_parser(
+        "watch",
+        help="Poll cc-switch and re-run union+retag sync after provider changes.",
+    )
     watch_parser.add_argument(
         "--interval",
         type=float,
