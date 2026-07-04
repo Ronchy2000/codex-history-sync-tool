@@ -280,6 +280,24 @@ class CodexHistorySync:
             union.update(table_blocks(text))
         return union
 
+    def official_provider_ids(self) -> set[str]:
+        ids = {"default", "codex-official"}
+        if not self.cc_switch_db.exists():
+            return ids
+        con = sqlite3.connect(f"file:{self.cc_switch_db}?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        try:
+            for row in con.execute("select id, coalesce(category, '') as category from providers where app_type='codex'"):
+                if (row["category"] or "").strip().lower() == "official":
+                    ids.add(row["id"])
+        finally:
+            con.close()
+        return ids
+
+    def current_provider_is_official(self) -> bool:
+        provider_id = self.current_provider_id()
+        return bool(provider_id and provider_id in self.official_provider_ids())
+
     def normalize_settings_json(self) -> dict[str, object]:
         result = {"changed": False, "path": str(self.cc_switch_settings)}
         if not self.cc_switch_settings.exists():
@@ -305,11 +323,37 @@ class CodexHistorySync:
             result["missing"] = True
             return result
         old_text = self.live_config.read_text(encoding="utf-8")
-        new_text = normalize_config_text(old_text, self.sqlite_home, block_union)
+        new_text = old_text
+        if self.current_provider_is_official():
+            new_text = strip_model_provider_routing(new_text)
+        new_text = normalize_config_text(new_text, self.sqlite_home, block_union)
         changed = new_text != old_text
         result["changed"] = changed
         if changed and not self.dry_run:
             self.live_config.write_text(new_text, encoding="utf-8")
+        return result
+
+    def normalize_common_config(self, block_union: dict[str, str]) -> dict[str, object]:
+        result = {"changed": False, "key": "common_config_codex"}
+        if not self.cc_switch_db.exists():
+            result["missing"] = True
+            return result
+        con = sqlite3.connect(str(self.cc_switch_db), timeout=10)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA busy_timeout=10000")
+        try:
+            row = con.execute("select value from settings where key='common_config_codex'").fetchone()
+            if row is None:
+                result["missing"] = True
+                return result
+            old_text = row["value"] or ""
+            new_text = normalize_config_text(strip_model_provider_routing(old_text), self.sqlite_home, block_union)
+            result["changed"] = new_text != old_text
+            if result["changed"] and not self.dry_run:
+                con.execute("update settings set value=? where key='common_config_codex'", (new_text,))
+                con.commit()
+        finally:
+            con.close()
         return result
 
     def normalize_provider_templates(self, block_union: dict[str, str]) -> dict[str, object]:
@@ -317,6 +361,7 @@ class CodexHistorySync:
         if not self.cc_switch_db.exists():
             result["missing"] = True
             return result
+        official_ids = self.official_provider_ids()
         con = sqlite3.connect(str(self.cc_switch_db), timeout=10)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA busy_timeout=10000")
@@ -333,7 +378,10 @@ class CodexHistorySync:
                 old_text = cfg.get("config", "")
                 if not isinstance(old_text, str):
                     old_text = ""
-                new_text = normalize_config_text(old_text, self.sqlite_home, block_union)
+                new_text = old_text
+                if row["id"] in official_ids:
+                    new_text = strip_model_provider_routing(new_text)
+                new_text = normalize_config_text(new_text, self.sqlite_home, block_union)
                 if new_text == old_text:
                     continue
                 changed += 1
@@ -683,6 +731,7 @@ class CodexHistorySync:
         block_union = self.gather_block_union()
         current_index_titles = self.load_current_index_titles()
         settings_report = self.normalize_settings_json()
+        common_report = self.normalize_common_config(block_union)
         provider_report = self.normalize_provider_templates(block_union)
         live_config_report = self.normalize_live_config(block_union)
         rollout_report = self.normalize_rollouts(backup_dir)
@@ -692,6 +741,7 @@ class CodexHistorySync:
             "backup_dir": backup_dir,
             "current_provider_id": self.current_provider_id(),
             "settings": settings_report,
+            "common_config": common_report,
             "provider_templates": provider_report,
             "live_config": live_config_report,
             "rollouts": rollout_report,
